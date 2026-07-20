@@ -1,0 +1,2340 @@
+<!DOCTYPE html>
+<!--
+  AIR DOODLE — hand-tracking "Quick, Draw!"  (Gen Z redesign)
+  ===========================================================
+  Draw in the air with your hand (webcam + MediaPipe Hands), and DoodleNet
+  (ml5.js) guesses what you're drawing in real time.
+
+  HOW TO RUN:
+  Webcam access and some CDN scripts may be blocked when opening via file://.
+  If the camera doesn't start, serve this file over HTTP, e.g.:
+
+      python3 -m http.server 8000
+
+  then open  http://localhost:8000/hand-draw-guess.html
+  (Requires an internet connection for the CDN libraries + models.)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AIR DOODLE ✏️ — draw in the air, AI guesses</title>
+
+<!-- Libraries (order matters: all loaded before the game script runs) -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.min.js"></script>
+<!-- ml5 v0.12.2 : last major line with the built-in DoodleNet image classifier -->
+<script src="https://cdn.jsdelivr.net/npm/ml5@0.12.2/dist/ml5.min.js"></script>
+<!-- PeerJS : WebRTC peer-to-peer connections for multiplayer parties -->
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+
+<!-- Fonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@600;700;800;900&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --paper: #FFF4E3;
+    --ink: #1E1B2E;
+    --pink: #FF5DA2;
+    --yellow: #FFD93D;
+    --purple: #7C5CFF;
+    --green: #2FD26B;
+    --orange: #FF8A3D;
+    --blue: #4DA8FF;
+    --red: #FF4D5E;
+    --card: #FFFFFF;
+    --shadow: 5px 5px 0 var(--ink);
+    --shadow-sm: 3px 3px 0 var(--ink);
+    --radius: 18px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(circle at 12% 18%, rgba(255,93,162,.14) 0 140px, transparent 141px),
+      radial-gradient(circle at 88% 8%,  rgba(124,92,255,.14) 0 160px, transparent 161px),
+      radial-gradient(circle at 80% 85%, rgba(255,217,61,.20) 0 170px, transparent 171px),
+      var(--paper);
+    color: var(--ink);
+    font-family: "Nunito", "Avenir Next", system-ui, sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100%;
+    padding: 16px 14px 32px;
+    overflow-x: hidden;
+  }
+
+  /* ---------- header ---------- */
+  header { text-align: center; margin-bottom: 16px; position: relative; }
+  .logoWrap { display: inline-block; position: relative; }
+  header h1 {
+    font-family: "Fredoka", sans-serif;
+    font-size: clamp(34px, 6vw, 52px);
+    font-weight: 700;
+    letter-spacing: 1px;
+    display: inline-block;
+    background: var(--yellow);
+    border: 3px solid var(--ink);
+    border-radius: 16px;
+    box-shadow: var(--shadow);
+    padding: 4px 22px 8px;
+    transform: rotate(-2deg);
+  }
+  header h1 .pencil { display: inline-block; transform: rotate(8deg); }
+  .sticker {
+    position: absolute; font-family: "Fredoka", sans-serif; font-weight: 600;
+    font-size: 13px; padding: 3px 10px; border: 2.5px solid var(--ink);
+    border-radius: 999px; box-shadow: var(--shadow-sm); white-space: nowrap;
+  }
+  .sticker.s1 { background: var(--pink); color: #fff; top: -12px; right: -46px; transform: rotate(7deg); }
+  .sticker.s2 { background: var(--blue); color: #fff; bottom: -10px; left: -52px; transform: rotate(-6deg); }
+  header p { font-weight: 800; font-size: 14px; margin-top: 14px; opacity: .75; }
+
+  /* ---------- layout ---------- */
+  #layout { display: flex; gap: 18px; flex-wrap: wrap; justify-content: center; max-width: 1120px; width: 100%; }
+  #stage { position: relative; flex: 1 1 560px; max-width: 680px; }
+  #side { flex: 0 1 320px; display: flex; flex-direction: column; gap: 14px; min-width: 280px; }
+
+  /* ---------- drawing pad ---------- */
+  #drawWrap {
+    position: relative;
+    border: 3px solid var(--ink); border-radius: var(--radius);
+    overflow: hidden; background: #FFFFFF;
+    box-shadow: 7px 7px 0 var(--ink);
+  }
+  #drawCanvas { display: block; width: 100%; height: auto; touch-action: none; cursor: crosshair; }
+  #fxCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+  #hud {
+    position: absolute; top: 0; left: 0; right: 0;
+    display: flex; justify-content: space-between; align-items: flex-start;
+    padding: 12px; pointer-events: none;
+  }
+  .hudBox {
+    background: var(--card); border: 3px solid var(--ink);
+    border-radius: 14px; padding: 6px 14px 8px; box-shadow: var(--shadow-sm);
+  }
+  #promptBox { transform: rotate(-1.5deg); }
+  #promptBox .label {
+    font-family: "Fredoka", sans-serif; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 2px; color: var(--pink);
+  }
+  #promptWord {
+    font-family: "Fredoka", sans-serif; font-size: 28px; font-weight: 700;
+    animation: promptPop .35s cubic-bezier(.2,1.6,.4,1);
+  }
+  @keyframes promptPop { from { transform: scale(.5) rotate(-6deg); } to { transform: scale(1) rotate(0); } }
+
+  #timerBox { text-align: center; min-width: 80px; transform: rotate(1.5deg); background: var(--yellow); }
+  #timerVal { font-family: "Fredoka", sans-serif; font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  #timerVal.low { color: var(--red); animation: pulse .5s infinite alternate; }
+  @keyframes pulse { from { transform: scale(1); } to { transform: scale(1.18); } }
+  #timerBox .label { font-family: "Fredoka", sans-serif; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.5px; }
+
+  /* streak flame chip on the pad */
+  #streakChip {
+    position: absolute; bottom: 12px; left: 12px;
+    background: var(--card); border: 3px solid var(--ink); border-radius: 999px;
+    box-shadow: var(--shadow-sm); padding: 5px 14px;
+    font-family: "Fredoka", sans-serif; font-weight: 700; font-size: 16px;
+    display: none; pointer-events: none;
+  }
+  #streakChip.show { display: block; animation: promptPop .3s cubic-bezier(.2,1.6,.4,1); }
+
+  /* ---------- banner (win / lose) ---------- */
+  #banner {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center; flex-direction: column; gap: 12px;
+    background: rgba(255,244,227,.88); backdrop-filter: blur(3px);
+    text-align: center; padding: 20px;
+  }
+  #banner.show { display: flex; }
+  #bannerTitle {
+    font-family: "Fredoka", sans-serif; font-size: clamp(38px, 7vw, 54px); font-weight: 700;
+    padding: 4px 26px 8px; border: 3px solid var(--ink); border-radius: 18px;
+    box-shadow: var(--shadow); transform: rotate(-2deg);
+    animation: bannerIn .4s cubic-bezier(.2,1.6,.4,1);
+  }
+  @keyframes bannerIn { from { transform: scale(.4) rotate(-14deg); opacity: 0; } to { transform: scale(1) rotate(-2deg); opacity: 1; } }
+  #bannerTitle.win { background: var(--green); color: #fff; }
+  #bannerTitle.lose { background: var(--red); color: #fff; }
+  #bannerSub { font-weight: 800; font-size: 16px; max-width: 420px; }
+  #bannerPts { font-family: "Fredoka", sans-serif; font-weight: 700; font-size: 22px; color: var(--purple); }
+  #bannerBtns { display: flex; gap: 10px; margin-top: 4px; }
+
+  #status {
+    margin-top: 14px; font-size: 13px; font-weight: 800;
+    display: flex; align-items: center; gap: 8px;
+  }
+  #statusDot { width: 11px; height: 11px; border-radius: 50%; background: var(--yellow); border: 2px solid var(--ink); flex: 0 0 auto; }
+  #statusDot.ok { background: var(--green); }
+  #statusDot.err { background: var(--red); }
+
+  /* ---------- cards ---------- */
+  .card {
+    background: var(--card); border: 3px solid var(--ink);
+    border-radius: var(--radius); padding: 14px 16px; box-shadow: var(--shadow);
+  }
+  .card h2 {
+    font-family: "Fredoka", sans-serif; font-size: 12px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 2px; margin-bottom: 10px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  #side .card:nth-child(odd) { transform: rotate(.6deg); }
+  #side .card:nth-child(even) { transform: rotate(-.6deg); }
+
+  #videoWrap { position: relative; border-radius: 12px; overflow: hidden; background: #000; border: 3px solid var(--ink); }
+  #previewCanvas { display: block; width: 100%; height: auto; transform: scaleX(-1); }
+  #penBadge {
+    position: absolute; bottom: 8px; left: 8px; font-family: "Fredoka", sans-serif;
+    font-size: 11px; font-weight: 700; padding: 3px 10px;
+    border-radius: 999px; background: var(--card); border: 2.5px solid var(--ink);
+  }
+  #penBadge.down { background: var(--green); color: #fff; }
+  #penBadge.erase { background: var(--pink, #FF5DA2); color: #fff; }
+
+  /* guesses */
+  .guessRow { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 14px; font-weight: 800; }
+  .guessRow .glabel { flex: 0 0 104px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .guessRow .gbarWrap { flex: 1; background: var(--paper); border: 2px solid var(--ink); border-radius: 999px; height: 16px; overflow: hidden; }
+  .guessRow .gbar { height: 100%; background: var(--purple); width: 0%; transition: width .25s; }
+  .guessRow:nth-child(2) .gbar { background: var(--blue); }
+  .guessRow:nth-child(3) .gbar { background: var(--orange); }
+  .guessRow.hit .glabel { color: var(--green); }
+  .guessRow.hit .gbar { background: var(--green); }
+  .guessRow .gpct { flex: 0 0 42px; text-align: right; font-variant-numeric: tabular-nums; opacity: .7; }
+  #noGuess { font-weight: 800; font-size: 13px; opacity: .55; }
+
+  /* score strip */
+  #scoreRow { display: flex; justify-content: space-around; text-align: center; }
+  #scoreRow .num {
+    font-family: "Fredoka", sans-serif; font-size: 28px; font-weight: 700; line-height: 1.15;
+  }
+  #scoreVal { color: var(--purple); }
+  #streakVal { color: var(--orange); }
+  #bestVal { color: var(--pink); }
+  #scoreRow .lbl { font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 1.5px; opacity: .6; }
+  .popNum { animation: numPop .4s cubic-bezier(.2,1.8,.4,1); }
+  @keyframes numPop { 30% { transform: scale(1.5); } 100% { transform: scale(1); } }
+
+  /* buttons */
+  #controls { display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    font-family: "Fredoka", sans-serif; font-weight: 600; font-size: 15px;
+    padding: 11px 14px; background: var(--card); color: var(--ink);
+    border: 3px solid var(--ink); border-radius: 14px; cursor: pointer;
+    box-shadow: var(--shadow-sm);
+    transition: transform .08s, box-shadow .08s;
+  }
+  #controls button { flex: 1 1 calc(50% - 5px); min-width: 0; }
+  button:hover { transform: translate(-1px,-1px); box-shadow: 4px 4px 0 var(--ink); }
+  button:active { transform: translate(3px,3px); box-shadow: 0 0 0 var(--ink); }
+  button.primary { background: var(--pink); color: #fff; }
+  button.secondary { background: var(--blue); color: #fff; }
+  button.accent { background: var(--yellow); }
+  #btnMute { position: absolute; top: -6px; right: -6px; padding: 6px 10px; font-size: 16px; border-radius: 999px; z-index: 3; }
+
+  /* ---------- starting / resume countdown ---------- */
+  #countdown {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(30,27,46,.30); backdrop-filter: blur(2px);
+    z-index: 6; pointer-events: none;
+  }
+  #countdown.show { display: flex; }
+  #countNum {
+    font-family: "Fredoka", sans-serif; font-weight: 700;
+    font-size: clamp(96px, 24vw, 190px); line-height: 1;
+    color: var(--yellow);
+    -webkit-text-stroke: 5px var(--ink);
+    paint-order: stroke fill;
+    text-shadow: 7px 7px 0 var(--ink);
+  }
+  #countNum.go { color: var(--green); }
+  #countNum.pop { animation: countPop .72s cubic-bezier(.2,1.5,.4,1); }
+  @keyframes countPop {
+    0%   { transform: scale(.2) rotate(-8deg); opacity: 0; }
+    28%  { transform: scale(1.18) rotate(0);   opacity: 1; }
+    70%  { transform: scale(1) rotate(0);      opacity: 1; }
+    100% { transform: scale(.7) rotate(4deg);  opacity: 0; }
+  }
+
+  /* ---------- pause screen ---------- */
+  #pauseScreen {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center; flex-direction: column; gap: 14px;
+    background: rgba(255,244,227,.90); backdrop-filter: blur(4px);
+    z-index: 5; text-align: center; padding: 20px;
+  }
+  #pauseScreen.show { display: flex; }
+  #pauseTitle {
+    font-family: "Fredoka", sans-serif; font-size: clamp(40px, 7vw, 56px); font-weight: 700;
+    background: var(--purple); color: #fff;
+    padding: 4px 30px 8px; border: 3px solid var(--ink); border-radius: 18px;
+    box-shadow: var(--shadow); transform: rotate(-2deg);
+    animation: bannerIn .35s cubic-bezier(.2,1.6,.4,1);
+  }
+  #pauseSub { font-weight: 800; font-size: 15px; opacity: .7; }
+  #pauseHint { font-weight: 800; font-size: 12px; opacity: .5; margin-top: 2px; }
+
+  /* ---------- mode select ---------- */
+  #modeScreen {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center; flex-direction: column; gap: 14px;
+    background: rgba(255,244,227,.93); backdrop-filter: blur(4px);
+    z-index: 7; text-align: center; padding: 20px;
+  }
+  #modeScreen.show { display: flex; }
+  #modeTitle {
+    font-family: "Fredoka", sans-serif; font-size: clamp(30px, 5vw, 42px); font-weight: 700;
+    background: var(--yellow); padding: 4px 26px 8px;
+    border: 3px solid var(--ink); border-radius: 18px;
+    box-shadow: var(--shadow); transform: rotate(-2deg); margin-bottom: 6px;
+    animation: bannerIn .35s cubic-bezier(.2,1.6,.4,1);
+  }
+  .modeBtn { width: min(340px, 86%); font-size: 17px; padding: 13px 16px; }
+  .modeBtn small {
+    display: block; font-family: "Nunito", sans-serif; font-size: 12px;
+    font-weight: 800; opacity: .85; margin-top: 2px;
+  }
+
+  /* ---------- home / multiplayer screens ---------- */
+  .overlayScreen {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center; flex-direction: column; gap: 14px;
+    background: rgba(255,244,227,.94); backdrop-filter: blur(4px);
+    z-index: 7; text-align: center; padding: 20px; overflow-y: auto;
+  }
+  .overlayScreen.show { display: flex; }
+  .overlayTitle {
+    font-family: "Fredoka", sans-serif; font-size: clamp(30px, 5vw, 42px); font-weight: 700;
+    background: var(--yellow); padding: 4px 26px 8px;
+    border: 3px solid var(--ink); border-radius: 18px;
+    box-shadow: var(--shadow); transform: rotate(-2deg); margin-bottom: 6px;
+    animation: bannerIn .35s cubic-bezier(.2,1.6,.4,1);
+  }
+  .backLink {
+    font-family: "Fredoka", sans-serif; font-weight: 600; font-size: 13px;
+    background: none; border: none; box-shadow: none; cursor: pointer;
+    text-decoration: underline; opacity: .6; padding: 4px 8px;
+  }
+  .backLink:hover, .backLink:active { transform: none; box-shadow: none; opacity: 1; }
+  .nameInput {
+    font-family: "Nunito", sans-serif; font-weight: 800; font-size: 16px;
+    padding: 11px 14px; width: min(340px, 86%);
+    border: 3px solid var(--ink); border-radius: 14px;
+    box-shadow: var(--shadow-sm); outline: none; text-align: center;
+    background: #fff; color: var(--ink);
+  }
+  /* lobby */
+  #linkRow { display: flex; gap: 8px; width: min(420px, 92%); }
+  #joinLinkBox {
+    flex: 1; font-size: 12px; font-weight: 800; padding: 10px;
+    border: 3px solid var(--ink); border-radius: 12px; background: #fff;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #lobbyPlayers {
+    display: flex; flex-wrap: wrap; gap: 8px; justify-content: center;
+    max-width: 460px;
+  }
+  .playerChip {
+    font-family: "Fredoka", sans-serif; font-weight: 600; font-size: 14px;
+    background: #fff; border: 2.5px solid var(--ink); border-radius: 999px;
+    padding: 5px 14px; box-shadow: var(--shadow-sm);
+  }
+  .playerChip.hostChip { background: var(--yellow); }
+  .lobbyGroup { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+  .lobbyLbl {
+    font-family: "Fredoka", sans-serif; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 2px; opacity: .6;
+  }
+  .segRow { display: flex; gap: 8px; }
+  .segBtn { font-size: 14px; padding: 9px 14px; }
+  .segBtn.sel { background: var(--purple); color: #fff; }
+  /* artist banner on the pad */
+  #artistChip {
+    position: absolute; bottom: 12px; right: 12px;
+    background: var(--purple); color: #fff;
+    border: 3px solid var(--ink); border-radius: 999px;
+    box-shadow: var(--shadow-sm); padding: 5px 14px;
+    font-family: "Fredoka", sans-serif; font-weight: 600; font-size: 14px;
+    display: none; pointer-events: none; max-width: 60%;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #artistChip.show { display: block; }
+  /* multiplayer scoreboard */
+  #mpScores { display: none; flex-direction: column; gap: 6px; }
+  .mpScoreRow {
+    display: flex; justify-content: space-between; align-items: center;
+    font-weight: 800; font-size: 14px; padding: 5px 10px;
+    border: 2.5px solid var(--ink); border-radius: 10px; background: var(--paper);
+  }
+  .mpScoreRow.artistNow { background: var(--yellow); }
+  .mpScoreRow .mpPts { font-family: "Fredoka", sans-serif; font-weight: 700; color: var(--purple); }
+  /* guess chat */
+  #guessFeed {
+    height: 150px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;
+    border: 2.5px solid var(--ink); border-radius: 12px; background: var(--paper);
+    padding: 8px; margin-bottom: 8px; text-align: left;
+  }
+  .guessMsg { font-size: 13px; font-weight: 800; line-height: 1.35; }
+  .guessMsg b { font-weight: 900; }
+  .guessMsg.correct { color: var(--green); }
+  .guessMsg.sys { opacity: .55; }
+  #guessInputRow { display: flex; gap: 8px; }
+  #guessInput {
+    flex: 1; font-family: "Nunito", sans-serif; font-weight: 800; font-size: 14px;
+    padding: 9px 12px; border: 3px solid var(--ink); border-radius: 12px;
+    outline: none; background: #fff; color: var(--ink); min-width: 0;
+  }
+  #btnGuess { flex: 0 0 auto; font-size: 14px; padding: 9px 14px; }
+
+  /* ---------- results screen ---------- */
+  #resultsScreen {
+    position: fixed; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(30,27,46,.45); backdrop-filter: blur(3px);
+    z-index: 50; padding: 18px;
+  }
+  #resultsScreen.show { display: flex; }
+  #resultsCard {
+    background: var(--paper); border: 3px solid var(--ink); border-radius: var(--radius);
+    box-shadow: 7px 7px 0 var(--ink); max-width: 720px; width: 100%;
+    max-height: 92vh; overflow-y: auto; padding: 22px 22px 26px; text-align: center;
+    animation: bannerIn .35s cubic-bezier(.2,1.6,.4,1);
+  }
+  #resultsTitle {
+    font-family: "Fredoka", sans-serif; font-size: clamp(28px, 5vw, 40px); font-weight: 700;
+    display: inline-block; background: var(--purple); color: #fff;
+    padding: 4px 24px 8px; border: 3px solid var(--ink); border-radius: 16px;
+    box-shadow: var(--shadow-sm); transform: rotate(-1.5deg);
+  }
+  #resultsSummary { font-weight: 900; font-size: 16px; margin: 14px 0 4px; }
+  #resultsGrid {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 12px; margin: 16px 0;
+  }
+  @media (max-width: 560px) { #resultsGrid { grid-template-columns: repeat(2, 1fr); } }
+  .resultCell {
+    background: #fff; border: 3px solid var(--ink); border-radius: 14px;
+    padding: 8px 8px 10px; box-shadow: var(--shadow-sm);
+  }
+  .resultCell:nth-child(odd) { transform: rotate(.8deg); }
+  .resultCell:nth-child(even) { transform: rotate(-.8deg); }
+  .resultCell img {
+    width: 100%; aspect-ratio: 1; display: block;
+    border: 2px solid var(--ink); border-radius: 10px; background: #fff;
+  }
+  .resultCell .rword { font-family: "Fredoka", sans-serif; font-weight: 700; font-size: 16px; margin-top: 6px; }
+  .resultCell.hitR .rword { color: var(--green); }
+  .resultCell.miss .rword { color: var(--red); }
+  .resultCell .rmeta { font-size: 11px; font-weight: 800; opacity: .6; }
+  #resultsBtns { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 8px; }
+
+  /* rules: wide strip under the drawing pad */
+  #instructions { margin-top: 16px; transform: rotate(-.4deg); }
+  #instructions ul {
+    list-style: none; font-size: 13.5px; font-weight: 700; line-height: 1.6; opacity: .85;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 4px 22px;
+  }
+  @media (max-width: 640px) { #instructions ul { grid-template-columns: 1fr; } }
+  #instructions li::before { content: "✦"; color: var(--pink); margin-right: 8px; }
+  #instructions b { font-weight: 900; }
+
+  @media (max-width: 720px) {
+    body { padding: 10px 10px 24px; }
+    .sticker.s1 { right: -18px; } .sticker.s2 { left: -14px; }
+    #side { flex-basis: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logoWrap">
+    <h1><span class="pencil">✏️</span> AIR DOODLE</h1>
+    <span class="sticker s1">AI powered</span>
+    <span class="sticker s2">no controller. just vibes</span>
+  </div>
+  <p>Draw in the air with your hand — the AI guesses what it is.</p>
+</header>
+
+<div id="layout">
+  <div id="stage">
+    <button id="btnMute" title="Toggle sound">🔊</button>
+    <div id="drawWrap">
+      <canvas id="drawCanvas" width="640" height="480"></canvas>
+      <canvas id="fxCanvas" width="640" height="480"></canvas>
+      <div id="hud">
+        <div class="hudBox" id="promptBox">
+          <div class="label"><span id="promptLabel">draw this ↓</span> <span id="roundInd"></span></div>
+          <div id="promptWord">—</div>
+        </div>
+        <div class="hudBox" id="timerBox">
+          <div id="timerVal">45</div>
+          <div class="label">sec</div>
+        </div>
+      </div>
+      <div id="streakChip">🔥 <span id="streakChipVal">0</span> streak</div>
+      <div id="artistChip"></div>
+      <div id="countdown"><span id="countNum">3</span></div>
+      <div id="pauseScreen">
+        <div id="pauseTitle">Paused ⏸</div>
+        <div id="pauseSub">Take a breather — your doodle's safe.</div>
+        <button id="btnResume" class="primary">▶ Resume</button>
+        <div id="pauseHint">press P or Esc to resume</div>
+      </div>
+      <div id="homeScreen" class="overlayScreen">
+        <div class="overlayTitle">How do you want to play?</div>
+        <button class="modeBtn primary" id="btnHomeSolo">Solo<small>just you and the AI</small></button>
+        <button class="modeBtn secondary" id="btnHomeMulti">Multiplayer<small>invite friends with a link and take turns drawing</small></button>
+      </div>
+
+      <div id="modeScreen">
+        <div id="modeTitle">Pick your round</div>
+        <button class="modeBtn primary" id="btnMode6">6-Doodle Round<small>6 prompts, then see all your doodles</small></button>
+        <button class="modeBtn secondary" id="btnModeEndless">Endless<small>keep drawing till you drop</small></button>
+        <button class="backLink" id="btnSoloBack">back</button>
+      </div>
+
+      <div id="mpSetupScreen" class="overlayScreen">
+        <div class="overlayTitle" id="mpSetupTitle">Multiplayer</div>
+        <input class="nameInput" id="nameInput" maxlength="16" placeholder="your name" autocomplete="off">
+        <button class="modeBtn primary" id="btnMpGo">Create party</button>
+        <div id="mpSetupStatus" style="font-weight:800;font-size:13px;opacity:.6;"></div>
+        <button class="backLink" id="btnMpBack">back</button>
+      </div>
+
+      <div id="lobbyScreen" class="overlayScreen">
+        <div class="overlayTitle">Party lobby</div>
+        <div class="lobbyGroup">
+          <div class="lobbyLbl">Share this link with friends</div>
+          <div id="linkRow">
+            <div id="joinLinkBox">—</div>
+            <button class="accent" id="btnCopyLink">Copy</button>
+          </div>
+        </div>
+        <div class="lobbyGroup">
+          <div class="lobbyLbl">Players</div>
+          <div id="lobbyPlayers"></div>
+        </div>
+        <div class="lobbyGroup" id="hostSettings">
+          <div class="lobbyLbl">Round</div>
+          <div class="segRow">
+            <button class="segBtn sel" id="segSix">Round of 6</button>
+            <button class="segBtn" id="segEndless">Endless</button>
+          </div>
+          <div class="lobbyLbl">Who guesses?</div>
+          <div class="segRow">
+            <button class="segBtn sel" id="segAI">AI guesses</button>
+            <button class="segBtn" id="segFriend">Friends guess</button>
+          </div>
+          <button class="modeBtn primary" id="btnStartParty">Start game</button>
+        </div>
+        <div id="lobbyStatus" style="font-weight:800;font-size:13px;opacity:.6;"></div>
+        <button class="backLink" id="btnLeaveParty">leave party</button>
+      </div>
+      <div id="banner">
+        <div id="bannerTitle"></div>
+        <div id="bannerSub"></div>
+        <div id="bannerPts"></div>
+        <div id="bannerBtns">
+          <button id="btnShare" class="secondary">📸 Share it</button>
+          <button id="btnNext" class="primary">Next →</button>
+        </div>
+      </div>
+    </div>
+    <div id="status"><span id="statusDot"></span><span id="statusText">Loading libraries…</span></div>
+
+    <div class="card" id="instructions">
+      <h2>🎮 How to play</h2>
+      <ul>
+        <li><b>Point</b> with just your index finger to draw; open your hand (all fingers splayed) to move around without drawing; make a <b>fist</b> to erase.</li>
+        <li><b>Move slowly</b>, keep your whole hand in frame.</li>
+        <li>Beat the timer → build a 🔥 <b>streak</b> for bonus points.</li>
+        <li>No camera? Draw with the <b>mouse</b> instead.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div id="side">
+    <div class="card">
+      <h2>📷 Camera &amp; hand tracking</h2>
+      <div id="videoWrap">
+        <canvas id="previewCanvas" width="320" height="240"></canvas>
+        <span id="penBadge">PEN UP</span>
+      </div>
+    </div>
+
+    <div class="card" id="guessCard">
+      <h2 id="guessCardTitle">🤖 AI guesses</h2>
+      <div id="guesses"><div id="noGuess">Start drawing and I'll guess…</div></div>
+      <div id="friendGuessUI" style="display:none;">
+        <div id="guessFeed"></div>
+        <div id="guessInputRow">
+          <input id="guessInput" maxlength="30" placeholder="type your guess…" autocomplete="off">
+          <button class="primary" id="btnGuess">Guess</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div id="mpScores"></div>
+      <div id="scoreRow">
+        <div><div class="num" id="scoreVal">0</div><div class="lbl">Score</div></div>
+        <div><div class="num" id="streakVal">0</div><div class="lbl">🔥 Streak</div></div>
+        <div><div class="num" id="bestVal">0</div><div class="lbl">Best</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div id="controls">
+        <button id="btnClear">🧽 Clear</button>
+        <button id="btnPause" class="secondary">⏸ Pause</button>
+        <button id="btnSkip" class="accent">⏭ Skip</button>
+        <button id="btnNew" class="primary">🎮 New game</button>
+        <button id="btnEndParty" class="secondary" style="display:none;">End game</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div id="resultsScreen">
+  <div id="resultsCard">
+    <div id="resultsTitle">Your doodles 🎨</div>
+    <div id="resultsSummary"></div>
+    <div id="resultsGrid"></div>
+    <div id="resultsBtns">
+      <button id="btnAgain" class="primary">🔁 Play again</button>
+      <button id="btnMenu" class="accent">🎮 Change mode</button>
+    </div>
+  </div>
+</div>
+
+<!-- hidden video element that feeds MediaPipe -->
+<video id="video" playsinline style="display:none"></video>
+
+<script>
+"use strict";
+
+/* ================================================================
+   One Euro filter (Casiez, Roussel, Vogel — CHI 2012)
+   ================================================================ */
+class LowPassFilter {
+  constructor() { this.initialized = false; this.hatX = 0; }
+  filter(x, alpha) {
+    if (!this.initialized) { this.initialized = true; this.hatX = x; }
+    else { this.hatX = alpha * x + (1 - alpha) * this.hatX; }
+    return this.hatX;
+  }
+  last() { return this.hatX; }
+  reset() { this.initialized = false; }
+}
+
+class OneEuroFilter {
+  constructor(minCutoff = 1.6, beta = 1.2, dCutoff = 1.0) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.xFilt = new LowPassFilter();
+    this.dxFilt = new LowPassFilter();
+    this.lastTime = null;
+  }
+  alpha(cutoff, dt) {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+  filter(x, t) {
+    let dt = 1 / 30;
+    if (this.lastTime !== null) {
+      dt = t - this.lastTime;
+      if (dt <= 0 || dt > 1) dt = 1 / 30;
+    }
+    this.lastTime = t;
+    const dx = this.xFilt.initialized ? (x - this.xFilt.last()) / dt : 0;
+    const edx = this.dxFilt.filter(dx, this.alpha(this.dCutoff, dt));
+    const cutoff = this.minCutoff + this.beta * Math.abs(edx);
+    return this.xFilt.filter(x, this.alpha(cutoff, dt));
+  }
+  reset() { this.xFilt.reset(); this.dxFilt.reset(); this.lastTime = null; }
+}
+
+/* ================================================================
+   DOM handles + constants
+   ================================================================ */
+const videoEl    = document.getElementById("video");
+const drawCanvas = document.getElementById("drawCanvas");
+const drawCtx    = drawCanvas.getContext("2d");
+const fxCanvas   = document.getElementById("fxCanvas");
+const fxCtx      = fxCanvas.getContext("2d");
+const prevCanvas = document.getElementById("previewCanvas");
+const prevCtx    = prevCanvas.getContext("2d");
+
+const statusDot   = document.getElementById("statusDot");
+const statusText  = document.getElementById("statusText");
+const promptWord  = document.getElementById("promptWord");
+const timerVal    = document.getElementById("timerVal");
+const banner      = document.getElementById("banner");
+const bannerTitle = document.getElementById("bannerTitle");
+const bannerSub   = document.getElementById("bannerSub");
+const bannerPts   = document.getElementById("bannerPts");
+const btnShare    = document.getElementById("btnShare");
+const btnNext     = document.getElementById("btnNext");
+const guessesEl   = document.getElementById("guesses");
+const penBadge    = document.getElementById("penBadge");
+const scoreEl     = document.getElementById("scoreVal");
+const streakEl    = document.getElementById("streakVal");
+const bestEl      = document.getElementById("bestVal");
+const streakChip  = document.getElementById("streakChip");
+const streakChipVal = document.getElementById("streakChipVal");
+const btnMute     = document.getElementById("btnMute");
+const countdownEl = document.getElementById("countdown");
+const countNum    = document.getElementById("countNum");
+const pauseScreen = document.getElementById("pauseScreen");
+const btnPause    = document.getElementById("btnPause");
+const btnResume   = document.getElementById("btnResume");
+const modeScreen  = document.getElementById("modeScreen");
+const roundInd    = document.getElementById("roundInd");
+const homeScreen    = document.getElementById("homeScreen");
+const mpSetupScreen = document.getElementById("mpSetupScreen");
+const lobbyScreen   = document.getElementById("lobbyScreen");
+const nameInput     = document.getElementById("nameInput");
+const mpSetupStatus = document.getElementById("mpSetupStatus");
+const joinLinkBox   = document.getElementById("joinLinkBox");
+const lobbyPlayers  = document.getElementById("lobbyPlayers");
+const hostSettings  = document.getElementById("hostSettings");
+const lobbyStatus   = document.getElementById("lobbyStatus");
+const artistChip    = document.getElementById("artistChip");
+const mpScores      = document.getElementById("mpScores");
+const guessCardTitle = document.getElementById("guessCardTitle");
+const friendGuessUI  = document.getElementById("friendGuessUI");
+const guessFeed      = document.getElementById("guessFeed");
+const guessInput     = document.getElementById("guessInput");
+const resultsScreen  = document.getElementById("resultsScreen");
+const resultsSummary = document.getElementById("resultsSummary");
+const resultsGrid    = document.getElementById("resultsGrid");
+
+const W = drawCanvas.width, H = drawCanvas.height;
+
+const PROMPTS = [
+  "cat","star","tree","apple","fish","house","clock","umbrella","sun","key",
+  "ladder","cloud","flower","eye","bird","candle","donut","moon","banana",
+  "envelope","mountain","spider","snake","car","cup","book","airplane","hat","chair","pizza"
+];
+
+const ROUND_SECONDS   = 45;
+const ROUNDS_PER_GAME = 6;
+const WIN_CONFIDENCE  = 0.35;
+const CLASSIFY_EVERY  = 400;
+const GESTURE_STABLE_FRAMES = 3;   // frames a gesture must persist before switching modes
+const FINGER_EXT_RATIO      = 1.10; // tip must be this much farther from wrist than the PIP joint
+const ERASE_RADIUS          = 34;   // px eraser radius around the cursor
+
+/* ================================================================
+   Game state
+   ================================================================ */
+let classifier = null;
+let classifierReady = false;
+let trackingReady = false;
+let cameraOK = false;
+
+let strokes = [];
+let currentStroke = null;
+let strokesDirty = false;
+let classifying = false;
+
+let penDown = false;
+let handMode = "navigate";        // navigate | draw | erase
+let pendingGesture = null;        // gesture waiting to become stable
+let pendingCount = 0;
+let cursor = null;
+let lastHandSeen = 0;
+
+let target = null;
+let score = 0, streak = 0, best = 0;
+let lastWin = null;                    // {word, conf, secs, pts} for the share card
+let gameState = "loading";             // loading | menu | countdown | playing | paused | won | timeout | results
+let gameMode = "endless";              // endless | six
+let roundNum = 0;                      // 1-based round counter within a six-round game
+let roundHistory = [];                 // [{word, won, pts, secs, img}] for the results gallery
+let timeLeft = ROUND_SECONDS;
+let timerHandle = null;
+let advanceHandle = null;
+let countdownActive = false;
+let firstStart = true;
+
+try { best = parseInt(localStorage.getItem("airdoodle_best") || "0", 10) || 0; } catch (e) {}
+bestEl.textContent = best;
+
+/* ---------- multiplayer state ---------- */
+let isMP = false;              // are we in a multiplayer party?
+let isHost = false;
+let peer = null;               // PeerJS peer
+let hostConn = null;           // guest → host connection
+let conns = [];                // host → guest connections
+let myId = null;               // my peer id
+let myName = "";
+let roomCode = null;
+let players = [];              // [{id, name, score}] — same order everywhere (host authoritative)
+let mpMode = "six";            // six | endless
+let guessMode = "ai";          // ai | friend
+let mpPhase = "idle";          // idle | lobby | playing | over
+let artistId = null;           // whose turn it is
+let turnNum = 0;               // 0-based global turn counter
+let mpWord = null;             // current word (artist + host always; everyone in AI mode)
+let turnLive = false;          // guesses/strokes accepted (between turnStart and turnEnd)
+let mpHistory = [];            // [{word, artistName, won, winnerName, img}]
+let strokeSendHandle = null;
+let hostTickHandle = null;
+let pendingJoinRoom = null;    // room code from the URL, join after name entry
+
+function isMyTurn() { return !isMP || artistId === myId; }
+function playerById(id) { return players.find(p => p.id === id) || null; }
+
+const filterX = new OneEuroFilter(1.6, 1.2);
+const filterY = new OneEuroFilter(1.6, 1.2);
+
+/* ================================================================
+   Sound (WebAudio synth — no assets) + haptics
+   ================================================================ */
+let audioCtx = null;
+let muted = false;
+function ensureAudio() {
+  if (muted) return null;
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return null; }
+  }
+  if (audioCtx.state === "suspended") audioCtx.resume();
+  return audioCtx;
+}
+function beep(freq, dur, type = "square", vol = 0.12, when = 0) {
+  const ctx = ensureAudio();
+  if (!ctx) return;
+  const t0 = ctx.currentTime + when;
+  const osc = ctx.createOscillator();
+  const g = ctx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(g); g.connect(ctx.destination);
+  osc.start(t0); osc.stop(t0 + dur + 0.02);
+}
+const sfx = {
+  click: () => beep(660, 0.06, "square", 0.08),
+  tick:  () => beep(980, 0.05, "square", 0.07),
+  win:   () => { [523, 659, 784, 1047].forEach((f, i) => beep(f, 0.16, "triangle", 0.14, i * 0.09)); },
+  streak:() => { [784, 988, 1175, 1568].forEach((f, i) => beep(f, 0.12, "triangle", 0.12, i * 0.06)); },
+  lose:  () => { beep(330, 0.22, "sawtooth", 0.10); beep(247, 0.3, "sawtooth", 0.10, 0.18); }
+};
+function buzz(pattern) { if (navigator.vibrate) { try { navigator.vibrate(pattern); } catch (e) {} } }
+btnMute.addEventListener("click", () => {
+  muted = !muted;
+  btnMute.textContent = muted ? "🔇" : "🔊";
+  if (!muted) sfx.click();
+});
+// unlock audio on first interaction anywhere
+window.addEventListener("pointerdown", () => { if (!muted) ensureAudio(); }, { once: true });
+
+/* ================================================================
+   Confetti (fx canvas overlay)
+   ================================================================ */
+const CONFETTI_COLORS = ["#FF5DA2", "#FFD93D", "#7C5CFF", "#2FD26B", "#4DA8FF", "#FF8A3D"];
+let particles = [];
+function burstConfetti(n = 90) {
+  for (let i = 0; i < n; i++) {
+    particles.push({
+      x: W / 2 + (Math.random() - 0.5) * 120,
+      y: H / 2 + (Math.random() - 0.5) * 60,
+      vx: (Math.random() - 0.5) * 11,
+      vy: -Math.random() * 9 - 3,
+      s: 4 + Math.random() * 6,
+      rot: Math.random() * Math.PI * 2,
+      vr: (Math.random() - 0.5) * 0.3,
+      color: CONFETTI_COLORS[i % CONFETTI_COLORS.length],
+      life: 90 + Math.random() * 50
+    });
+  }
+}
+function stepConfetti() {
+  fxCtx.clearRect(0, 0, W, H);
+  if (!particles.length) return;
+  particles = particles.filter(p => p.life > 0 && p.y < H + 20);
+  for (const p of particles) {
+    p.x += p.vx; p.y += p.vy; p.vy += 0.25; p.vx *= 0.99;
+    p.rot += p.vr; p.life--;
+    fxCtx.save();
+    fxCtx.translate(p.x, p.y);
+    fxCtx.rotate(p.rot);
+    fxCtx.fillStyle = p.color;
+    fxCtx.globalAlpha = Math.min(1, p.life / 40);
+    fxCtx.fillRect(-p.s / 2, -p.s / 2, p.s, p.s * 0.62);
+    fxCtx.restore();
+  }
+}
+
+/* ================================================================
+   Status helper
+   ================================================================ */
+function setStatus(text, kind) { // kind: ok | warn | err
+  statusText.textContent = text;
+  statusDot.className = kind === "ok" ? "ok" : (kind === "err" ? "err" : "");
+}
+
+/* ================================================================
+   Hand tracking (MediaPipe Hands)
+   ================================================================ */
+function dist2D(a, b, aspect) {
+  const dx = (a.x - b.x) * aspect;
+  const dy = (a.y - b.y);
+  return Math.hypot(dx, dy);
+}
+
+function onResults(results) {
+  if (!trackingReady) {
+    trackingReady = true;
+    maybeStartGame();
+  }
+
+  prevCtx.save();
+  prevCtx.clearRect(0, 0, prevCanvas.width, prevCanvas.height);
+  prevCtx.drawImage(results.image, 0, 0, prevCanvas.width, prevCanvas.height);
+
+  const hasHand = results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
+
+  if (hasHand) {
+    const lm = results.multiHandLandmarks[0];
+    if (window.drawConnectors && window.HAND_CONNECTIONS) {
+      drawConnectors(prevCtx, lm, HAND_CONNECTIONS, { color: "#FF5DA2", lineWidth: 2 });
+      drawLandmarks(prevCtx, lm, { color: "#FFD93D", lineWidth: 1, radius: 2.5 });
+    }
+    prevCtx.restore();
+
+    lastHandSeen = performance.now();
+    const t = performance.now() / 1000;
+    const aspect = W / H;
+
+    const indexTip = lm[8], wrist = lm[0];
+
+    // A finger is "extended" when its tip is clearly farther from the wrist than its PIP joint.
+    const ext = (tip, pip) =>
+      dist2D(lm[tip], wrist, aspect) > dist2D(lm[pip], wrist, aspect) * FINGER_EXT_RATIO;
+    const idxUp = ext(8, 6), midUp = ext(12, 10), ringUp = ext(16, 14), pinkUp = ext(20, 18);
+
+    let gesture = null;
+    if (idxUp && !midUp && !ringUp && !pinkUp) gesture = "draw";       // pointer finger only
+    else if (!idxUp && !midUp && !ringUp && !pinkUp) gesture = "erase"; // closed fist
+    else if (idxUp && midUp && ringUp && pinkUp) gesture = "navigate";  // open splayed hand
+
+    // Require the gesture to hold for a few frames before switching (debounce).
+    if (gesture && gesture !== handMode) {
+      if (gesture === pendingGesture) pendingCount++;
+      else { pendingGesture = gesture; pendingCount = 1; }
+      if (pendingCount >= GESTURE_STABLE_FRAMES) { handMode = gesture; pendingGesture = null; pendingCount = 0; }
+    } else {
+      pendingGesture = null; pendingCount = 0;
+    }
+
+    const wasDown = penDown;
+    penDown = handMode === "draw";
+
+    // Track the index tip when pointing/navigating; the middle knuckle when fisted.
+    const tracked = handMode === "erase" ? lm[9] : indexTip;
+    const sx = filterX.filter(tracked.x, t);
+    const sy = filterY.filter(tracked.y, t);
+    cursor = { x: (1 - sx) * W, y: sy * H };
+
+    if (handMode === "erase" && gameState === "playing" && isMyTurn()) {
+      eraseAt(cursor.x, cursor.y, ERASE_RADIUS);
+    }
+
+    if (penDown && gameState === "playing" && isMyTurn()) {
+      if (!wasDown || !currentStroke) {
+        currentStroke = [{ x: cursor.x, y: cursor.y }];
+        strokes.push(currentStroke);
+      } else {
+        const last = currentStroke[currentStroke.length - 1];
+        if (Math.hypot(cursor.x - last.x, cursor.y - last.y) > 1.5) {
+          currentStroke.push({ x: cursor.x, y: cursor.y });
+          strokesDirty = true;
+        }
+      }
+    } else if (wasDown && !penDown) {
+      currentStroke = null;
+      strokesDirty = true;
+    }
+    if (gameState === "playing" && trackingReady && cameraOK && isMyTurn()) {
+      setStatus(handMode === "draw"  ? "Drawing… (open your hand to lift the pen)"
+              : handMode === "erase" ? "Erasing… (open your hand to stop)"
+                                     : "Hand detected — point your index finger to draw, fist to erase", "ok");
+    }
+  } else {
+    prevCtx.restore();
+    if (penDown) { penDown = false; currentStroke = null; strokesDirty = true; }
+    handMode = "navigate";
+    pendingGesture = null; pendingCount = 0;
+    cursor = null;
+    filterX.reset(); filterY.reset();
+    if (gameState === "playing" && isMyTurn()) setStatus("Show your hand to the camera", "warn");
+  }
+
+  penBadge.textContent = handMode === "draw" ? "PEN DOWN" : (handMode === "erase" ? "ERASING" : "PEN UP");
+  penBadge.className = handMode === "draw" ? "down" : (handMode === "erase" ? "erase" : "");
+}
+
+/* Remove stroke points within radius r of (x, y), splitting strokes where needed. */
+function eraseAt(x, y, r) {
+  let changed = false;
+  const next = [];
+  for (const s of strokes) {
+    let seg = [];
+    for (const p of s) {
+      if (Math.hypot(p.x - x, p.y - y) <= r) {
+        changed = true;
+        if (seg.length) { next.push(seg); seg = []; }
+      } else {
+        seg.push(p);
+      }
+    }
+    if (seg.length) next.push(seg);
+  }
+  if (changed) {
+    strokes = next;
+    currentStroke = null;
+    strokesDirty = true;
+  }
+}
+
+async function initHands() {
+  if (typeof Hands === "undefined" || typeof Camera === "undefined") {
+    setStatus("MediaPipe failed to load from CDN — check your internet connection and reload.", "err");
+    return;
+  }
+  const hands = new Hands({
+    locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`
+  });
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.5
+  });
+  hands.onResults(onResults);
+
+  const camera = new Camera(videoEl, {
+    onFrame: async () => { try { await hands.send({ image: videoEl }); } catch (e) { /* first frames while wasm loads */ } },
+    width: 640,
+    height: 480
+  });
+  try {
+    await camera.start();
+    cameraOK = true;
+    setStatus("Camera on — warming up hand tracker…", "warn");
+  } catch (err) {
+    console.error(err);
+    setStatus("Webcam blocked or unavailable. Allow camera access and reload — or draw with the mouse instead.", "err");
+    trackingReady = true;
+    maybeStartGame();
+  }
+}
+
+/* ================================================================
+   DoodleNet (ml5.js)
+   ================================================================ */
+async function initClassifier() {
+  if (typeof ml5 === "undefined") {
+    setStatus("ml5.js failed to load from CDN — check your internet connection and reload.", "err");
+    return;
+  }
+  try {
+    classifier = await ml5.imageClassifier("DoodleNet");
+    classifierReady = true;
+    maybeStartGame();
+  } catch (err) {
+    console.error(err);
+    setStatus("Couldn't load the DoodleNet model — check your connection and reload.", "err");
+  }
+}
+
+const clfCanvas = document.createElement("canvas");
+clfCanvas.width = 280; clfCanvas.height = 280;
+const clfCtx = clfCanvas.getContext("2d");
+
+function strokeBounds() {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, nPts = 0;
+  for (const s of strokes) for (const p of s) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    nPts++;
+  }
+  return { minX, minY, maxX, maxY, nPts };
+}
+
+function drawStrokesInto(ctx, size, pad, strokeStyle, lineWidth) {
+  const { minX, minY, maxX, maxY, nPts } = strokeBounds();
+  if (nPts < 2) return false;
+  const side = Math.max(maxX - minX, maxY - minY, 32);
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  const content = size - pad * 2, offset = pad;
+  const scale = content / side;
+  const tx = (x) => offset + (x - (cx - side / 2)) * scale;
+  const ty = (y) => offset + (y - (cy - side / 2)) * scale;
+  ctx.strokeStyle = strokeStyle;
+  ctx.lineWidth = lineWidth;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  for (const s of strokes) {
+    if (s.length === 0) continue;
+    ctx.beginPath();
+    ctx.moveTo(tx(s[0].x), ty(s[0].y));
+    if (s.length === 1) ctx.lineTo(tx(s[0].x) + 0.1, ty(s[0].y));
+    for (let i = 1; i < s.length; i++) ctx.lineTo(tx(s[i].x), ty(s[i].y));
+    ctx.stroke();
+  }
+  return true;
+}
+
+function buildClassifierInput() {
+  const { nPts } = strokeBounds();
+  if (nPts < 6) return null;
+  clfCtx.fillStyle = "#ffffff";
+  clfCtx.fillRect(0, 0, 280, 280);
+  drawStrokesInto(clfCtx, 280, 28, "#000000", 16);
+  return clfCanvas;
+}
+
+const norm = (s) => String(s).toLowerCase().replace(/[_\s]+/g, " ").trim();
+
+function renderGuesses(results) {
+  guessesEl.innerHTML = "";
+  results.slice(0, 3).forEach((r) => {
+    const hit = target && norm(r.label) === norm(target);
+    const row = document.createElement("div");
+    row.className = "guessRow" + (hit ? " hit" : "");
+    const pct = Math.round(r.confidence * 100);
+    row.innerHTML =
+      `<span class="glabel">${norm(r.label)}</span>` +
+      `<span class="gbarWrap"><span class="gbar" style="width:${pct}%"></span></span>` +
+      `<span class="gpct">${pct}%</span>`;
+    guessesEl.appendChild(row);
+  });
+}
+
+function classifyLoop() {
+  if (gameState !== "playing" || !classifierReady || classifying || !strokesDirty) return;
+  if (isMP && (guessMode !== "ai" || !isMyTurn())) return;  // only the artist classifies, and only in AI mode
+  const input = buildClassifierInput();
+  if (!input) return;
+  classifying = true;
+  strokesDirty = false;
+  classifier.classify(input, (err, results) => {
+    classifying = false;
+    if (err || !results || !results.length) return;
+    renderGuesses(results);
+    if (isMP) mpSend({ t: "guesses", g: results.slice(0, 3).map(r => ({ label: r.label, confidence: r.confidence })) });
+    const top = results[0];
+    if (gameState === "playing" && target &&
+        norm(top.label) === norm(target) && top.confidence >= WIN_CONFIDENCE) {
+      if (isMP) mpAiWin(top.confidence);
+      else winRound(top.confidence);
+    }
+  });
+}
+setInterval(classifyLoop, CLASSIFY_EVERY);
+
+/* ================================================================
+   Share card
+   ================================================================ */
+function buildShareCard() {
+  const S = 1080;
+  const c = document.createElement("canvas");
+  c.width = S; c.height = S;
+  const ctx = c.getContext("2d");
+
+  // background
+  ctx.fillStyle = "#FFF4E3";
+  ctx.fillRect(0, 0, S, S);
+  const blobs = [["#FF5DA2", 120, 140], ["#7C5CFF", 950, 120], ["#FFD93D", 940, 940], ["#4DA8FF", 130, 950]];
+  for (const [col, bx, by] of blobs) {
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(bx, by, 170, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // white doodle panel
+  const px = 140, py = 250, pw = S - 280, ph = 520;
+  ctx.fillStyle = "#fff";
+  ctx.strokeStyle = "#1E1B2E";
+  ctx.lineWidth = 8;
+  roundRect(ctx, px + 14, py + 14, pw, ph, 36); ctx.fillStyle = "#1E1B2E"; ctx.fill(); // hard shadow
+  roundRect(ctx, px, py, pw, ph, 36); ctx.fillStyle = "#fff"; ctx.fill(); ctx.stroke();
+
+  // strokes into panel
+  ctx.save();
+  ctx.translate(px, py);
+  const size = Math.min(pw, ph);
+  ctx.translate((pw - size) / 2, (ph - size) / 2);
+  drawStrokesInto(ctx, size, 60, "#1E1B2E", 14);
+  ctx.restore();
+
+  // title
+  ctx.fillStyle = "#1E1B2E";
+  ctx.textAlign = "center";
+  ctx.font = "700 84px Fredoka, sans-serif";
+  ctx.fillText("✏️ AIR DOODLE", S / 2, 150);
+
+  const w = lastWin;
+  ctx.font = "900 52px Nunito, sans-serif";
+  if (w) {
+    ctx.fillText(`I drew "${w.word}" in ${w.secs}s`, S / 2, 860);
+    ctx.fillStyle = "#7C5CFF";
+    ctx.font = "700 44px Fredoka, sans-serif";
+    ctx.fillText(`AI was ${Math.round(w.conf * 100)}% sure · +${w.pts} pts · 🔥 streak ${streak}`, S / 2, 930);
+  } else {
+    ctx.fillText("Draw in the air. AI guesses. Can you beat it?", S / 2, 880);
+  }
+  ctx.fillStyle = "#1E1B2E";
+  ctx.font = "800 34px Nunito, sans-serif";
+  ctx.globalAlpha = 0.55;
+  ctx.fillText("no controller. just vibes ✦", S / 2, 1010);
+  ctx.globalAlpha = 1;
+  return c;
+}
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+async function shareCard() {
+  sfx.click();
+  const c = buildShareCard();
+  // try native share first (mobile), fall back to download
+  try {
+    if (navigator.canShare) {
+      const blob = await new Promise(res => c.toBlob(res, "image/png"));
+      const file = new File([blob], "air-doodle.png", { type: "image/png" });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: "Air Doodle" });
+        return;
+      }
+    }
+  } catch (e) { /* user cancelled or unsupported — fall through */ }
+  const a = document.createElement("a");
+  a.href = c.toDataURL("image/png");
+  a.download = "air-doodle.png";
+  a.click();
+}
+
+/* ================================================================
+   Game flow
+   ================================================================ */
+/* 3-2-1-GO overlay; calls `done` when it finishes.
+   `steps` is an array like ["3","2","1","GO!"]. */
+function runCountdown(steps, done) {
+  countdownActive = true;
+  countdownEl.classList.add("show");
+  let i = 0;
+  (function tick() {
+    if (i >= steps.length) {
+      countdownEl.classList.remove("show");
+      countdownActive = false;
+      if (done) done();
+      return;
+    }
+    const label = steps[i];
+    const isGo = /^go/i.test(label);
+    countNum.textContent = label;
+    countNum.className = "";          // restart the pop animation
+    void countNum.offsetWidth;
+    countNum.classList.add("pop");
+    if (isGo) countNum.classList.add("go");
+    if (isGo) { beep(880, 0.20, "triangle", 0.16); buzz([40, 30, 70]); }
+    else      { beep(560, 0.12, "square", 0.11); buzz(20); }
+    i++;
+    setTimeout(tick, isGo ? 560 : 720);
+  })();
+}
+
+function maybeStartGame() {
+  if (gameState !== "loading") return;
+  if (!classifierReady) { setStatus("Loading DoodleNet model…", "warn"); return; }
+  if (!trackingReady)   { setStatus("Starting camera & hand tracker…", "warn"); return; }
+  showHome();
+}
+
+/* ---------- screens / navigation ---------- */
+function hideAllScreens() {
+  banner.className = "";
+  pauseScreen.classList.remove("show");
+  resultsScreen.classList.remove("show");
+  modeScreen.classList.remove("show");
+  homeScreen.classList.remove("show");
+  mpSetupScreen.classList.remove("show");
+  lobbyScreen.classList.remove("show");
+}
+
+function showHome() {
+  clearTimeout(advanceHandle);
+  clearInterval(timerHandle);
+  gameState = "menu";
+  hideAllScreens();
+  if (pendingJoinRoom) {   // arrived via an invite link — go straight to the join screen
+    showMpSetup();
+    return;
+  }
+  homeScreen.classList.add("show");
+  setStatus("Pick solo or multiplayer to start", "ok");
+}
+
+function showModeSelect() {
+  clearTimeout(advanceHandle);
+  clearInterval(timerHandle);
+  gameState = "menu";
+  hideAllScreens();
+  modeScreen.classList.add("show");
+  setStatus("Pick a mode to start playing", "ok");
+}
+
+function showMpSetup() {
+  gameState = "menu";
+  hideAllScreens();
+  mpSetupScreen.classList.add("show");
+  document.getElementById("mpSetupTitle").textContent = pendingJoinRoom ? "Join party" : "Multiplayer";
+  document.getElementById("btnMpGo").textContent = pendingJoinRoom ? "Join party" : "Create party";
+  mpSetupStatus.textContent = pendingJoinRoom ? `Joining party ${pendingJoinRoom}` : "";
+  nameInput.focus();
+}
+
+document.getElementById("btnHomeSolo").addEventListener("click", () => { sfx.click(); showModeSelect(); });
+document.getElementById("btnHomeMulti").addEventListener("click", () => { sfx.click(); showMpSetup(); });
+document.getElementById("btnSoloBack").addEventListener("click", () => { sfx.click(); hideAllScreens(); homeScreen.classList.add("show"); });
+document.getElementById("btnMpBack").addEventListener("click", () => {
+  sfx.click();
+  pendingJoinRoom = null;
+  hideAllScreens();
+  homeScreen.classList.add("show");
+});
+
+function beginGame(mode) {
+  isMP = false;
+  setMpUIVisible(false);
+  gameMode = mode;
+  hideAllScreens();
+  score = 0; streak = 0; roundNum = 0; roundHistory = [];
+  scoreEl.textContent = score;
+  updateStreakUI();
+  firstStart = true;          // 3-2-1-GO countdown at the start of every game
+  sfx.click();
+  startRound();
+}
+
+document.getElementById("btnMode6").addEventListener("click", () => beginGame("six"));
+document.getElementById("btnModeEndless").addEventListener("click", () => beginGame("endless"));
+
+/* ---------- round history / results gallery ---------- */
+function snapshotDrawing() {
+  const c = document.createElement("canvas");
+  c.width = 240; c.height = 240;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, 240, 240);
+  drawStrokesInto(ctx, 240, 24, "#1E1B2E", 8);
+  return c.toDataURL("image/png");
+}
+
+function recordRound(won, pts) {
+  roundHistory.push({
+    word: target, won, pts,
+    secs: ROUND_SECONDS - Math.max(timeLeft, 0),
+    img: snapshotDrawing()
+  });
+}
+
+function advanceRound() {
+  if (gameMode === "six" && roundNum >= ROUNDS_PER_GAME) showResults();
+  else startRound();
+}
+
+function showResults() {
+  clearTimeout(advanceHandle);
+  clearInterval(timerHandle);
+  gameState = "results";
+  banner.className = "";
+  const wins = roundHistory.filter(r => r.won).length;
+  resultsSummary.textContent =
+    `The AI guessed ${wins} of ${roundHistory.length} doodles · ${score} pts`;
+  resultsGrid.innerHTML = "";
+  for (const r of roundHistory) {
+    const cell = document.createElement("div");
+    cell.className = "resultCell " + (r.won ? "hitR" : "miss");
+    cell.innerHTML =
+      `<img src="${r.img}" alt="doodle of ${r.word}">` +
+      `<div class="rword">${r.won ? "✔" : "✖"} ${r.word}</div>` +
+      `<div class="rmeta">${r.won ? `+${r.pts} pts · ${r.secs}s` : "not guessed"}</div>`;
+    resultsGrid.appendChild(cell);
+  }
+  const bA = document.getElementById("btnAgain"), bM = document.getElementById("btnMenu");
+  bA.textContent = "🔁 Play again"; bA.style.display = "";
+  bM.textContent = "🎮 Change mode";
+  resultsScreen.classList.add("show");
+  if (wins >= ROUNDS_PER_GAME / 2) { sfx.win(); burstConfetti(140); } else sfx.lose();
+  setStatus("Game over — check out your doodles!", "ok");
+}
+
+document.getElementById("btnAgain").addEventListener("click", () => {
+  if (isMP) {
+    if (isHost) { sfx.click(); hostBackToLobby(); }
+    return;
+  }
+  resultsScreen.classList.remove("show");
+  beginGame(gameMode);
+});
+document.getElementById("btnMenu").addEventListener("click", () => {
+  sfx.click();
+  if (isMP) { leaveParty(); return; }
+  showHome();
+});
+
+function pickPrompt() {
+  let p;
+  do { p = PROMPTS[Math.floor(Math.random() * PROMPTS.length)]; } while (p === target && PROMPTS.length > 1);
+  return p;
+}
+
+function clearDrawing() {
+  strokes = [];
+  currentStroke = null;
+  strokesDirty = false;
+  guessesEl.innerHTML = '<div id="noGuess">Start drawing and I\'ll guess…</div>';
+}
+
+function popNumber(el) {
+  el.classList.remove("popNum");
+  void el.offsetWidth;   // restart the animation
+  el.classList.add("popNum");
+}
+
+function updateStreakUI() {
+  streakEl.textContent = streak;
+  streakChipVal.textContent = streak;
+  streakChip.className = streak >= 2 ? "show" : "";
+  if (streak > best) {
+    best = streak;
+    bestEl.textContent = best;
+    popNumber(bestEl);
+    try { localStorage.setItem("airdoodle_best", String(best)); } catch (e) {}
+  }
+}
+
+function startTimer() {
+  clearInterval(timerHandle);
+  timerHandle = setInterval(() => {
+    if (gameState !== "playing") return;
+    timeLeft--;
+    timerVal.textContent = Math.max(timeLeft, 0);
+    if (timeLeft <= 5 && timeLeft > 0) { timerVal.className = "low"; sfx.tick(); buzz(15); }
+    if (timeLeft <= 0) timeoutRound();
+  }, 1000);
+}
+
+function goLive() {
+  gameState = "playing";
+  btnPause.textContent = "⏸ Pause";
+  setStatus(cameraOK ? "Point your index finger to draw — go!" : "Camera off: draw with the mouse — go!", "ok");
+  startTimer();
+}
+
+function startRound() {
+  clearTimeout(advanceHandle);
+  clearInterval(timerHandle);
+  banner.className = "";
+  pauseScreen.classList.remove("show");
+  roundNum++;
+  roundInd.textContent = gameMode === "six" ? `· ${Math.min(roundNum, ROUNDS_PER_GAME)}/${ROUNDS_PER_GAME}` : "";
+  target = pickPrompt();
+  promptWord.textContent = target;
+  // re-trigger prompt pop animation
+  promptWord.style.animation = "none";
+  void promptWord.offsetWidth;
+  promptWord.style.animation = "";
+  clearDrawing();
+  timeLeft = ROUND_SECONDS;
+  timerVal.textContent = timeLeft;
+  timerVal.className = "";
+  if (firstStart) {
+    // starting countdown the very first time the game boots up
+    firstStart = false;
+    gameState = "countdown";
+    setStatus("Get ready…", "warn");
+    runCountdown(["3", "2", "1", "GO!"], goLive);
+  } else {
+    goLive();
+  }
+}
+
+/* ---------- pause / resume ---------- */
+function pauseGame() {
+  if (gameState !== "playing") return;
+  gameState = "paused";
+  clearInterval(timerHandle);
+  if (penDown) { penDown = false; currentStroke = null; }
+  timerVal.className = "";           // stop the low-time pulse while frozen
+  btnPause.textContent = "▶ Resume";
+  pauseScreen.classList.add("show");
+  setStatus("Paused — timer frozen at " + Math.max(timeLeft, 0) + "s", "warn");
+  sfx.click();
+}
+
+function resumeGame() {
+  if (gameState !== "paused") return;
+  pauseScreen.classList.remove("show");
+  btnPause.textContent = "⏸ Pause";
+  gameState = "countdown";
+  setStatus("Resuming…", "warn");
+  runCountdown(["3", "2", "1"], goLive);
+}
+
+function togglePause() {
+  if (isMP) return;   // no pausing in multiplayer — the party waits for no one
+  if (gameState === "playing") pauseGame();
+  else if (gameState === "paused") resumeGame();
+}
+
+btnPause.addEventListener("click", togglePause);
+btnResume.addEventListener("click", resumeGame);
+window.addEventListener("keydown", (e) => {
+  if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+  if (e.key === "p" || e.key === "P" || e.key === "Escape") { e.preventDefault(); togglePause(); }
+});
+
+function winRound(conf) {
+  gameState = "won";
+  clearInterval(timerHandle);
+  streak++;
+  const mult = 1 + Math.min(streak - 1, 5) * 0.2;      // streak multiplier, caps at 2x
+  const pts = Math.round((100 + timeLeft * 10) * mult);
+  score += pts;
+  scoreEl.textContent = score;
+  popNumber(scoreEl);
+  updateStreakUI();
+  popNumber(streakEl);
+  lastWin = { word: target, conf, secs: ROUND_SECONDS - timeLeft, pts };
+  recordRound(true, pts);
+  const lastOfSix = gameMode === "six" && roundNum >= ROUNDS_PER_GAME;
+
+  bannerTitle.textContent = ["Got it!", "Slay ✨", "W drawing", "Certified artist 🎨"][Math.min(streak - 1, 3)];
+  bannerTitle.className = "win";
+  bannerSub.textContent = `That's a ${target} — the AI was ${Math.round(conf * 100)}% sure.`;
+  bannerPts.textContent = `+${pts} pts` + (streak >= 2 ? `  ·  🔥 ${streak} streak (${mult.toFixed(1)}x)` : "");
+  btnShare.style.display = "";
+  btnNext.style.display = "";
+  banner.className = "show";
+  btnNext.textContent = lastOfSix ? "Results →" : "Next →";
+  burstConfetti(streak >= 3 ? 150 : 90);
+  if (streak >= 3) sfx.streak(); else sfx.win();
+  buzz([50, 40, 90]);
+  advanceHandle = setTimeout(advanceRound, 4000);
+}
+
+function timeoutRound() {
+  gameState = "timeout";
+  clearInterval(timerHandle);
+  streak = 0;
+  updateStreakUI();
+  lastWin = null;
+  recordRound(false, 0);
+  btnNext.textContent = (gameMode === "six" && roundNum >= ROUNDS_PER_GAME) ? "Results →" : "Next →";
+  bannerTitle.textContent = "Time's up!";
+  bannerTitle.className = "lose";
+  bannerSub.textContent = `The AI couldn't tell that was a ${target}. Streak reset 💔`;
+  bannerPts.textContent = "";
+  btnShare.style.display = "none";
+  btnNext.style.display = "";
+  banner.className = "show";
+  sfx.lose();
+  buzz(180);
+  advanceHandle = setTimeout(advanceRound, 2800);
+}
+
+btnShare.addEventListener("click", () => {
+  clearTimeout(advanceHandle);            // don't advance while sharing
+  shareCard();
+});
+btnNext.addEventListener("click", () => { sfx.click(); advanceRound(); });
+
+document.getElementById("btnClear").addEventListener("click", () => {
+  if (isMP && !isMyTurn()) return;
+  sfx.click();
+  clearDrawing();
+  if (isMP) mpSendStrokes(true);
+});
+document.getElementById("btnSkip").addEventListener("click", () => {
+  if (gameState === "loading" || gameState === "menu" || gameState === "results" || countdownActive) return;
+  sfx.click();
+  if (isMP) {
+    if (isMyTurn() && turnLive) mpSend({ t: "skip" });
+    return;
+  }
+  streak = 0; updateStreakUI();
+  if (gameMode === "six") {
+    // a skipped prompt still uses up one of the 6 rounds
+    if (gameState === "playing") recordRound(false, 0);
+    advanceRound();
+  } else {
+    startRound();
+  }
+});
+document.getElementById("btnNew").addEventListener("click", () => {
+  if (gameState === "loading") return;
+  sfx.click();
+  if (isMP) { leaveParty(); return; }
+  showHome();
+});
+
+/* ================================================================
+   Multiplayer (PeerJS) — host is the authority, guests connect to it
+   ================================================================ */
+const promptLabel = document.getElementById("promptLabel");
+const PEER_PREFIX = "airdoodle-";
+const TURN_GAP_MS = 3200;
+
+function makeRoomCode() {
+  let c = "";
+  const chars = "abcdefghjkmnpqrstuvwxyz23456789";
+  for (let i = 0; i < 6; i++) c += chars[Math.floor(Math.random() * chars.length)];
+  return c;
+}
+function joinLink() {
+  return location.href.split(/[?#]/)[0] + "?room=" + roomCode;
+}
+
+/* ---------- transport helpers ---------- */
+function hostBroadcast(msg, exceptId) {
+  for (const c of conns) {
+    if (c.open && c.peer !== exceptId) {
+      // in friend mode the word is secret: only the artist's copy carries it
+      if (msg.t === "turnStart" && msg.secretWord !== undefined) {
+        const copy = Object.assign({}, msg);
+        copy.word = (c.peer === msg.artist) ? msg.secretWord : null;
+        delete copy.secretWord;
+        c.send(copy);
+        continue;
+      }
+      c.send(msg);
+    }
+  }
+  if (myId !== exceptId) {
+    if (msg.t === "turnStart" && msg.secretWord !== undefined) {
+      const copy = Object.assign({}, msg);
+      copy.word = (myId === msg.artist) ? msg.secretWord : null;
+      delete copy.secretWord;
+      clientHandle(copy);
+      return;
+    }
+    clientHandle(msg);
+  }
+}
+function mpSend(msg) {          // player → host (host short-circuits to itself)
+  msg.from = myId;
+  if (isHost) hostHandle(msg);
+  else if (hostConn && hostConn.open) hostConn.send(msg);
+}
+
+/* ---------- stroke sync ---------- */
+let lastStrokeSig = "";
+function encodeStrokes() {
+  return strokes.map(s => s.map(p => [Math.round(p.x), Math.round(p.y)]));
+}
+function decodeStrokes(enc) {
+  return enc.map(s => s.map(q => ({ x: q[0], y: q[1] })));
+}
+function mpSendStrokes(force) {
+  if (!isMP || !isMyTurn()) return;
+  let n = 0;
+  for (const s of strokes) n += s.length;
+  const sig = strokes.length + ":" + n;
+  if (!force && sig === lastStrokeSig) return;
+  lastStrokeSig = sig;
+  mpSend({ t: "strokes", s: encodeStrokes() });
+}
+
+/* ---------- party lifecycle ---------- */
+function createParty() {
+  roomCode = makeRoomCode();
+  isHost = true;
+  startPeer(PEER_PREFIX + roomCode);
+}
+function joinParty(code) {
+  roomCode = code;
+  isHost = false;
+  startPeer(null);
+}
+
+function startPeer(id) {
+  mpSetupStatus.textContent = "Connecting…";
+  try {
+    peer = id ? new Peer(id) : new Peer();
+  } catch (e) {
+    mpSetupStatus.textContent = "Couldn't start the connection — check your internet and try again.";
+    return;
+  }
+  peer.on("open", (pid) => {
+    myId = pid;
+    if (isHost) {
+      isMP = true;
+      mpPhase = "lobby";
+      players = [{ id: myId, name: myName, score: 0 }];
+      enterLobby();
+    } else {
+      const c = peer.connect(PEER_PREFIX + roomCode, { reliable: true });
+      hostConn = c;
+      c.on("open", () => {
+        isMP = true;
+        mpPhase = "lobby";
+        c.send({ t: "join", from: myId, name: myName });
+        enterLobby();
+      });
+      c.on("data", (msg) => clientHandle(msg));
+      c.on("close", () => partyEnded("The party was closed by the host."));
+      c.on("error", () => partyEnded("Lost the connection to the party."));
+      setTimeout(() => {
+        if (!isMP) { mpSetupStatus.textContent = "Couldn't find that party — double-check the link."; try { peer.destroy(); } catch (e) {} peer = null; }
+      }, 8000);
+    }
+  });
+  peer.on("connection", (c) => {
+    if (!isHost) { c.close(); return; }
+    c.on("data", (msg) => hostHandle(msg, c));
+    c.on("close", () => hostDropPlayer(c.peer));
+    c.on("error", () => hostDropPlayer(c.peer));
+    conns.push(c);
+  });
+  peer.on("error", (err) => {
+    if (err.type === "unavailable-id") {
+      // room code collision — extremely unlikely, just roll a new one
+      roomCode = makeRoomCode();
+      try { peer.destroy(); } catch (e) {}
+      startPeer(PEER_PREFIX + roomCode);
+      return;
+    }
+    if (err.type === "peer-unavailable") {
+      mpSetupStatus.textContent = "Couldn't find that party — double-check the link.";
+      return;
+    }
+    if (!isMP) mpSetupStatus.textContent = "Connection error (" + err.type + "). Try again.";
+  });
+}
+
+function resetMpState() {
+  clearInterval(strokeSendHandle);
+  clearInterval(hostTickHandle);
+  clearTimeout(advanceHandle);
+  isMP = false; isHost = false;
+  hostConn = null; conns = [];
+  players = []; mpPhase = "idle";
+  artistId = null; mpWord = null; turnLive = false;
+  turnNum = 0; mpHistory = [];
+  roomCode = null; myId = null;
+  if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+}
+
+function leaveParty() {
+  if (isHost) hostBroadcastSafe({ t: "partyClosed" });
+  resetMpState();
+  pendingJoinRoom = null;
+  try { history.replaceState(null, "", location.pathname); } catch (e) {}
+  setMpUIVisible(false);
+  showHome();
+}
+function hostBroadcastSafe(msg) {
+  for (const c of conns) { try { if (c.open) c.send(msg); } catch (e) {} }
+}
+function partyEnded(why) {
+  resetMpState();
+  pendingJoinRoom = null;
+  setMpUIVisible(false);
+  showHome();
+  setStatus(why, "err");
+}
+
+/* ---------- lobby ---------- */
+function enterLobby() {
+  mpPhase = "lobby";
+  gameState = "menu";
+  hideAllScreens();
+  lobbyScreen.classList.add("show");
+  joinLinkBox.textContent = joinLink();
+  hostSettings.style.display = isHost ? "" : "none";
+  lobbyStatus.textContent = isHost
+    ? "Share the link, then hit Start when everyone's in."
+    : "Waiting for the host to start the game…";
+  renderLobby();
+  if (isHost) hostBroadcast({ t: "roster", players: players, hostId: myId }, myId);
+  setStatus("In the party lobby", "ok");
+}
+
+function renderLobby() {
+  lobbyPlayers.innerHTML = "";
+  for (const p of players) {
+    const chip = document.createElement("div");
+    chip.className = "playerChip" + (players[0] && p.id === players[0].id ? " hostChip" : "");
+    chip.textContent = p.name + (p.id === myId ? " (you)" : "");
+    lobbyPlayers.appendChild(chip);
+  }
+}
+
+document.getElementById("btnMpGo").addEventListener("click", () => {
+  const n = nameInput.value.trim();
+  if (!n) { mpSetupStatus.textContent = "Enter a name first."; nameInput.focus(); return; }
+  myName = n;
+  sfx.click();
+  if (pendingJoinRoom) joinParty(pendingJoinRoom);
+  else createParty();
+});
+nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("btnMpGo").click(); });
+
+document.getElementById("btnCopyLink").addEventListener("click", async () => {
+  sfx.click();
+  const link = joinLink();
+  try { await navigator.clipboard.writeText(link); }
+  catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = link; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch (e2) {}
+    ta.remove();
+  }
+  const btn = document.getElementById("btnCopyLink");
+  btn.textContent = "Copied!";
+  setTimeout(() => { btn.textContent = "Copy"; }, 1400);
+});
+
+document.getElementById("btnLeaveParty").addEventListener("click", () => { sfx.click(); leaveParty(); });
+
+/* lobby settings (host only) */
+function segSelect(onId, offId) {
+  document.getElementById(onId).classList.add("sel");
+  document.getElementById(offId).classList.remove("sel");
+}
+document.getElementById("segSix").addEventListener("click", () => { mpMode = "six"; segSelect("segSix", "segEndless"); sfx.click(); });
+document.getElementById("segEndless").addEventListener("click", () => { mpMode = "endless"; segSelect("segEndless", "segSix"); sfx.click(); });
+document.getElementById("segAI").addEventListener("click", () => { guessMode = "ai"; segSelect("segAI", "segFriend"); sfx.click(); });
+document.getElementById("segFriend").addEventListener("click", () => { guessMode = "friend"; segSelect("segFriend", "segAI"); sfx.click(); });
+
+document.getElementById("btnStartParty").addEventListener("click", () => {
+  if (!isHost) return;
+  if (players.length < 2) { lobbyStatus.textContent = "You need at least 2 players to start."; return; }
+  sfx.click();
+  hostStartGame();
+});
+
+/* ---------- host: game engine ---------- */
+let hostWord = null;
+let hostTimeLeft = 0;
+let hostTurnActive = false;
+
+function hostStartGame() {
+  mpPhase = "playing";
+  turnNum = 0;
+  for (const p of players) p.score = 0;
+  hostBroadcast({ t: "startGame", mpMode, guessMode, players });
+  hostNextTurn(true);
+}
+
+function totalTurns() { return ROUNDS_PER_GAME * players.length; }
+
+function hostNextTurn(first) {
+  if (mpPhase !== "playing") return;
+  if (players.length < 2) { hostEndGame(); return; }
+  if (mpMode === "six" && turnNum >= totalTurns()) { hostEndGame(); return; }
+  const artist = players[turnNum % players.length];
+  hostWord = pickPrompt();
+  hostTurnActive = true;
+  const msg = {
+    t: "turnStart",
+    artist: artist.id,
+    artistName: artist.name,
+    turnNum,
+    totalTurns: mpMode === "six" ? totalTurns() : 0,
+    countdown: !!first,
+    word: hostWord,                    // AI mode: everyone sees the word
+    len: hostWord.length
+  };
+  if (guessMode === "friend") { msg.secretWord = hostWord; msg.word = null; }
+  hostBroadcast(msg);
+  // authoritative timer (starts after the 3-2-1-GO countdown on the first turn)
+  clearInterval(hostTickHandle);
+  hostTimeLeft = ROUND_SECONDS;
+  const startDelay = first ? 3400 : 300;
+  setTimeout(() => {
+    if (!hostTurnActive || mpPhase !== "playing") return;
+    hostTickHandle = setInterval(() => {
+      if (!hostTurnActive) { clearInterval(hostTickHandle); return; }
+      hostTimeLeft--;
+      hostBroadcast({ t: "tick", left: Math.max(hostTimeLeft, 0) });
+      if (hostTimeLeft <= 0) hostEndTurn("timeout", null, null);
+    }, 1000);
+  }, startDelay);
+}
+
+function hostEndTurn(reason, winnerId, conf) {
+  if (!hostTurnActive) return;
+  hostTurnActive = false;
+  clearInterval(hostTickHandle);
+  const left = Math.max(hostTimeLeft, 0);
+  const ptsMap = {};
+  const artist = players[turnNum % players.length];
+  if (reason === "ai") {
+    ptsMap[artist.id] = 100 + left * 10;
+  } else if (reason === "friend" && winnerId) {
+    ptsMap[winnerId] = 100 + left * 5;
+    ptsMap[artist.id] = 50 + left * 3;
+  }
+  for (const id in ptsMap) {
+    const p = playerById(id);
+    if (p) p.score += ptsMap[id];
+  }
+  turnNum++;
+  hostBroadcast({
+    t: "turnEnd", reason, word: hostWord,
+    winner: winnerId, conf: conf || 0, ptsMap,
+    players: players, secs: ROUND_SECONDS - left
+  });
+  hostWord = null;
+  clearTimeout(advanceHandle);
+  advanceHandle = setTimeout(() => hostNextTurn(false), TURN_GAP_MS);
+}
+
+function hostEndGame() {
+  mpPhase = "over";
+  hostTurnActive = false;
+  clearInterval(hostTickHandle);
+  hostBroadcast({ t: "gameOver", players });
+}
+
+function hostBackToLobby() {
+  mpPhase = "lobby";
+  hostTurnActive = false;
+  clearInterval(hostTickHandle);
+  clearTimeout(advanceHandle);
+  for (const p of players) p.score = 0;
+  hostBroadcast({ t: "backToLobby", players });
+}
+
+function hostDropPlayer(id) {
+  conns = conns.filter(c => c.peer !== id);
+  const gone = playerById(id);
+  if (!gone) return;
+  players = players.filter(p => p.id !== id);
+  hostBroadcast({ t: "roster", players, hostId: myId, left: gone.name });
+  if (mpPhase === "playing") {
+    if (players.length < 2) { hostEndGame(); return; }
+    if (artistId === id && hostTurnActive) hostEndTurn("skip", null, null);
+  }
+}
+
+function hostHandle(msg, conn) {
+  switch (msg.t) {
+    case "join": {
+      if (playerById(msg.from)) break;
+      players.push({ id: msg.from, name: String(msg.name || "Player").slice(0, 16), score: 0 });
+      hostBroadcast({ t: "roster", players, hostId: myId });
+      if (mpPhase === "playing" && conn) {
+        // late joiner: let them watch; they get a turn next rotation
+        conn.send({ t: "startGame", mpMode, guessMode, players });
+      }
+      break;
+    }
+    case "strokes":
+      if (msg.from === artistId) hostBroadcast(msg, msg.from);
+      break;
+    case "guesses":
+      if (msg.from === artistId) hostBroadcast(msg, msg.from);
+      break;
+    case "guess": {
+      if (!hostTurnActive || msg.from === artistId) break;
+      const text = String(msg.text || "").slice(0, 40);
+      if (hostWord && norm(text) === norm(hostWord)) {
+        hostEndTurn("friend", msg.from, null);
+      } else {
+        const p = playerById(msg.from);
+        hostBroadcast({ t: "chat", by: p ? p.name : "?", text });
+      }
+      break;
+    }
+    case "skip":
+      if (msg.from === artistId) hostEndTurn("skip", null, null);
+      break;
+    case "aiWin":
+      if (msg.from === artistId && guessMode === "ai") hostEndTurn("ai", msg.from, msg.conf);
+      break;
+  }
+}
+
+function mpAiWin(conf) {
+  if (!turnLive) return;
+  mpSend({ t: "aiWin", conf });
+}
+
+/* ---------- client: shared UI handling (host included) ---------- */
+function setMpUIVisible(mp) {
+  mpScores.style.display = mp ? "flex" : "none";
+  document.getElementById("scoreRow").style.display = mp ? "none" : "";
+  streakChip.className = "";
+  if (!mp) {
+    artistChip.classList.remove("show");
+    friendGuessUI.style.display = "none";
+    guessesEl.style.display = "";
+    guessCardTitle.textContent = "🤖 AI guesses";
+    promptLabel.textContent = "draw this ↓";
+    btnPause.style.display = "";
+    document.getElementById("btnEndParty").style.display = "none";
+  } else {
+    btnPause.style.display = "none";
+  }
+}
+document.getElementById("btnEndParty").addEventListener("click", () => {
+  if (isMP && isHost && mpPhase === "playing") { sfx.click(); hostTurnActive = false; clearInterval(hostTickHandle); clearTimeout(advanceHandle); hostEndGame(); }
+});
+
+function renderMpScores() {
+  mpScores.innerHTML = "";
+  const sorted = players.slice().sort((a, b) => b.score - a.score);
+  for (const p of sorted) {
+    const row = document.createElement("div");
+    row.className = "mpScoreRow" + (p.id === artistId && mpPhase === "playing" ? " artistNow" : "");
+    row.innerHTML = `<span>${p.id === artistId ? "✏ " : ""}${escapeHtml(p.name)}${p.id === myId ? " (you)" : ""}</span><span class="mpPts">${p.score}</span>`;
+    mpScores.appendChild(row);
+  }
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function feedMsg(html, cls) {
+  const d = document.createElement("div");
+  d.className = "guessMsg" + (cls ? " " + cls : "");
+  d.innerHTML = html;
+  guessFeed.appendChild(d);
+  guessFeed.scrollTop = guessFeed.scrollHeight;
+}
+
+function configureGuessCard() {
+  const iAmArtist = artistId === myId;
+  if (guessMode === "friend") {
+    guessCardTitle.textContent = iAmArtist ? "💬 Their guesses" : "💬 Guess the doodle";
+    guessesEl.style.display = "none";
+    friendGuessUI.style.display = "";
+    guessInput.disabled = iAmArtist;
+    document.getElementById("btnGuess").disabled = iAmArtist;
+    guessInput.placeholder = iAmArtist ? "you're drawing — no guessing!" : "type your guess…";
+  } else {
+    guessCardTitle.textContent = "🤖 AI guesses";
+    guessesEl.style.display = "";
+    friendGuessUI.style.display = "none";
+  }
+}
+
+function sendGuess() {
+  const text = guessInput.value.trim();
+  if (!text || !turnLive || artistId === myId) return;
+  guessInput.value = "";
+  feedMsg(`<b>you:</b> ${escapeHtml(text)}`);
+  mpSend({ t: "guess", text });
+}
+document.getElementById("btnGuess").addEventListener("click", sendGuess);
+guessInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendGuess(); });
+
+function clientHandle(msg) {
+  switch (msg.t) {
+    case "roster":
+      players = msg.players;
+      if (msg.left) feedMsg(`<b>${escapeHtml(msg.left)}</b> left the party`, "sys");
+      if (mpPhase === "lobby") renderLobby();
+      renderMpScores();
+      break;
+
+    case "startGame":
+      mpMode = msg.mpMode;
+      guessMode = msg.guessMode;
+      players = msg.players;
+      mpPhase = "playing";
+      gameMode = mpMode === "six" ? "six" : "endless";
+      mpHistory = [];
+      hideAllScreens();
+      setMpUIVisible(true);
+      document.getElementById("btnEndParty").style.display = (isHost && mpMode === "endless") ? "" : "none";
+      guessFeed.innerHTML = "";
+      renderMpScores();
+      break;
+
+    case "turnStart": {
+      artistId = msg.artist;
+      mpWord = msg.word;                 // null for guessers in friend mode
+      target = msg.word;                 // classifier target (artist / AI mode)
+      turnLive = true;
+      lastStrokeSig = "";
+      clearDrawing();
+      clearTimeout(advanceHandle);
+      banner.className = "";
+      timeLeft = ROUND_SECONDS;
+      timerVal.textContent = timeLeft;
+      timerVal.className = "";
+      const iAmArtist = artistId === myId;
+      promptLabel.textContent = iAmArtist ? "draw this ↓" : (guessMode === "friend" ? "guess this ↓" : "they're drawing ↓");
+      promptWord.textContent = msg.word ? msg.word : "_ ".repeat(msg.len).trim();
+      promptWord.style.animation = "none"; void promptWord.offsetWidth; promptWord.style.animation = "";
+      roundInd.textContent = msg.totalTurns ? `· ${Math.min(msg.turnNum + 1, msg.totalTurns)}/${msg.totalTurns}` : "";
+      artistChip.textContent = iAmArtist ? "Your turn — draw!" : `${msg.artistName} is drawing`;
+      artistChip.classList.add("show");
+      configureGuessCard();
+      renderMpScores();
+      guessesEl.innerHTML = '<div id="noGuess">Waiting for the doodle…</div>';
+      if (guessMode === "friend") feedMsg(iAmArtist ? "your turn — friends are guessing" : `${escapeHtml(msg.artistName)} is drawing — guess away!`, "sys");
+      clearInterval(strokeSendHandle);
+      if (iAmArtist) strokeSendHandle = setInterval(() => { if (turnLive) mpSendStrokes(); }, 120);
+      if (msg.countdown) {
+        gameState = "countdown";
+        setStatus("Get ready…", "warn");
+        runCountdown(["3", "2", "1", "GO!"], () => { gameState = "playing"; setStatus(iAmArtist ? "Draw!" : "Watch the doodle appear", "ok"); });
+      } else {
+        gameState = "playing";
+        setStatus(iAmArtist ? "Your turn — draw!" : `${msg.artistName} is drawing`, "ok");
+      }
+      break;
+    }
+
+    case "tick":
+      timeLeft = msg.left;
+      timerVal.textContent = timeLeft;
+      if (timeLeft <= 5 && timeLeft > 0) { timerVal.className = "low"; sfx.tick(); }
+      else if (timeLeft > 5) timerVal.className = "";
+      break;
+
+    case "strokes":
+      if (artistId !== myId) { strokes = decodeStrokes(msg.s); currentStroke = null; }
+      break;
+
+    case "guesses":
+      if (artistId !== myId) renderGuesses(msg.g);
+      break;
+
+    case "chat":
+      feedMsg(`<b>${escapeHtml(msg.by)}:</b> ${escapeHtml(msg.text)}`);
+      break;
+
+    case "turnEnd": {
+      turnLive = false;
+      gameState = "turnend";
+      clearInterval(strokeSendHandle);
+      players = msg.players;
+      const won = msg.reason === "ai" || msg.reason === "friend";
+      const artist = playerById(artistId);
+      const artistName = artist ? artist.name : "?";
+      const winner = msg.winner ? playerById(msg.winner) : null;
+      mpHistory.push({
+        word: msg.word, won,
+        artistName,
+        winnerName: winner ? winner.name : null,
+        secs: msg.secs, img: snapshotDrawing()
+      });
+      promptWord.textContent = msg.word;
+      const myPts = msg.ptsMap[myId] || 0;
+      if (msg.reason === "ai") {
+        bannerTitle.textContent = "The AI got it!";
+        bannerTitle.className = "win";
+        bannerSub.textContent = `${artistName} drew "${msg.word}" — the AI was ${Math.round(msg.conf * 100)}% sure.`;
+      } else if (msg.reason === "friend") {
+        bannerTitle.textContent = winner && winner.id === myId ? "You got it!" : `${winner ? winner.name : "Someone"} got it!`;
+        bannerTitle.className = "win";
+        bannerSub.textContent = `The word was "${msg.word}" — drawn by ${artistName}.`;
+        feedMsg(`<b>${escapeHtml(winner ? winner.name : "?")}</b> guessed it! The word was "${escapeHtml(msg.word)}"`, "correct");
+      } else if (msg.reason === "skip") {
+        bannerTitle.textContent = "Skipped";
+        bannerTitle.className = "lose";
+        bannerSub.textContent = `The word was "${msg.word}".`;
+      } else {
+        bannerTitle.textContent = "Time's up!";
+        bannerTitle.className = "lose";
+        bannerSub.textContent = `Nobody got it — the word was "${msg.word}".`;
+      }
+      bannerPts.textContent = myPts ? `+${myPts} pts` : "";
+      btnShare.style.display = "none";
+      btnNext.style.display = "none";
+      banner.className = "show";
+      if (won) { if (myPts) { sfx.win(); burstConfetti(110); } else sfx.click(); }
+      else sfx.lose();
+      renderMpScores();
+      break;
+    }
+
+    case "gameOver":
+      players = msg.players;
+      mpPhase = "over";
+      mpShowResults();
+      break;
+
+    case "backToLobby":
+      players = msg.players;
+      mpPhase = "lobby";
+      gameState = "menu";
+      turnLive = false;
+      clearInterval(strokeSendHandle);
+      enterLobby();
+      break;
+
+    case "partyClosed":
+      partyEnded("The host closed the party.");
+      break;
+  }
+}
+
+/* ---------- multiplayer results ---------- */
+function mpShowResults() {
+  clearTimeout(advanceHandle);
+  clearInterval(strokeSendHandle);
+  gameState = "results";
+  banner.className = "";
+  artistChip.classList.remove("show");
+  const wins = mpHistory.filter(r => r.won).length;
+  const sorted = players.slice().sort((a, b) => b.score - a.score);
+  const podium = sorted.map((p, i) => `${i + 1}. ${escapeHtml(p.name)} — ${p.score} pts`).join("  ·  ");
+  resultsSummary.innerHTML = `${wins} of ${mpHistory.length} doodles guessed<br>${podium}`;
+  resultsGrid.innerHTML = "";
+  for (const r of mpHistory) {
+    const cell = document.createElement("div");
+    cell.className = "resultCell " + (r.won ? "hitR" : "miss");
+    cell.innerHTML =
+      `<img src="${r.img}" alt="doodle of ${escapeHtml(r.word)}">` +
+      `<div class="rword">${r.won ? "✔" : "✖"} ${escapeHtml(r.word)}</div>` +
+      `<div class="rmeta">by ${escapeHtml(r.artistName)}${r.winnerName ? " · guessed by " + escapeHtml(r.winnerName) : ""}</div>`;
+    resultsGrid.appendChild(cell);
+  }
+  document.getElementById("btnAgain").textContent = isHost ? "Back to lobby" : "Play again";
+  document.getElementById("btnAgain").style.display = isHost ? "" : "none";
+  document.getElementById("btnMenu").textContent = "Leave party";
+  resultsScreen.classList.add("show");
+  if (wins >= mpHistory.length / 2) { sfx.win(); burstConfetti(140); } else sfx.lose();
+  setStatus("Game over — check out everyone's doodles!", "ok");
+}
+
+/* ---------- boot: invite links ---------- */
+(function parseRoomFromUrl() {
+  try {
+    const m = new URLSearchParams(location.search).get("room");
+    if (m && /^[a-z0-9]{4,10}$/i.test(m)) pendingJoinRoom = m.toLowerCase();
+  } catch (e) {}
+})();
+
+/* ================================================================
+   Mouse / touch fallback
+   ================================================================ */
+let pointerDrawing = false;
+function canvasPoint(e) {
+  const r = drawCanvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
+}
+drawCanvas.addEventListener("pointerdown", (e) => {
+  if (gameState !== "playing" || !isMyTurn()) return;
+  pointerDrawing = true;
+  drawCanvas.setPointerCapture(e.pointerId);
+  currentStroke = [canvasPoint(e)];
+  strokes.push(currentStroke);
+});
+drawCanvas.addEventListener("pointermove", (e) => {
+  if (!pointerDrawing || !currentStroke) return;
+  const p = canvasPoint(e);
+  const last = currentStroke[currentStroke.length - 1];
+  if (Math.hypot(p.x - last.x, p.y - last.y) > 1.5) { currentStroke.push(p); strokesDirty = true; }
+});
+window.addEventListener("pointerup", () => {
+  if (pointerDrawing) { pointerDrawing = false; currentStroke = null; strokesDirty = true; }
+});
+
+/* ================================================================
+   Render loop
+   ================================================================ */
+function render() {
+  drawCtx.clearRect(0, 0, W, H);
+
+  // dotted grid, notebook-style
+  drawCtx.fillStyle = "rgba(30,27,46,0.10)";
+  for (let gx = 32; gx < W; gx += 32) {
+    for (let gy = 32; gy < H; gy += 32) {
+      drawCtx.beginPath(); drawCtx.arc(gx, gy, 1.4, 0, Math.PI * 2); drawCtx.fill();
+    }
+  }
+
+  // strokes — chunky marker ink
+  drawCtx.strokeStyle = "#1E1B2E";
+  drawCtx.lineWidth = 7;
+  drawCtx.lineCap = "round";
+  drawCtx.lineJoin = "round";
+  for (const s of strokes) {
+    if (!s.length) continue;
+    drawCtx.beginPath();
+    drawCtx.moveTo(s[0].x, s[0].y);
+    if (s.length === 1) drawCtx.lineTo(s[0].x + 0.1, s[0].y);
+    for (let i = 1; i < s.length; i++) drawCtx.lineTo(s[i].x, s[i].y);
+    drawCtx.stroke();
+  }
+
+  // cursor: pink dot when drawing, dashed ring when erasing, hollow purple when navigating
+  if (cursor && performance.now() - lastHandSeen < 400) {
+    if (handMode === "erase") {
+      drawCtx.beginPath();
+      drawCtx.arc(cursor.x, cursor.y, ERASE_RADIUS, 0, Math.PI * 2);
+      drawCtx.strokeStyle = "#FF5DA2";
+      drawCtx.lineWidth = 3;
+      drawCtx.setLineDash([7, 6]);
+      drawCtx.stroke();
+      drawCtx.setLineDash([]);
+      drawCtx.fillStyle = "rgba(255,93,162,0.12)";
+      drawCtx.fill();
+      stepConfetti();
+      requestAnimationFrame(render);
+      return;
+    }
+    drawCtx.beginPath();
+    drawCtx.arc(cursor.x, cursor.y, penDown ? 10 : 8, 0, Math.PI * 2);
+    if (penDown) {
+      drawCtx.fillStyle = "#FF5DA2";
+      drawCtx.fill();
+      drawCtx.strokeStyle = "#1E1B2E";
+      drawCtx.lineWidth = 2.5;
+      drawCtx.stroke();
+    } else {
+      drawCtx.strokeStyle = "#7C5CFF";
+      drawCtx.lineWidth = 3;
+      drawCtx.stroke();
+      drawCtx.beginPath();
+      drawCtx.arc(cursor.x, cursor.y, 2.2, 0, Math.PI * 2);
+      drawCtx.fillStyle = "#7C5CFF";
+      drawCtx.fill();
+    }
+  }
+
+  stepConfetti();
+  requestAnimationFrame(render);
+}
+
+/* ================================================================
+   Boot
+   ================================================================ */
+window.addEventListener("load", () => {
+  setStatus("Loading DoodleNet & starting camera…", "warn");
+  requestAnimationFrame(render);
+  initClassifier();
+  initHands();
+});
+</script>
+</body>
+</html>
